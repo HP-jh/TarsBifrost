@@ -2,13 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -16,8 +21,89 @@ import (
 	"github.com/HP-jh/TarsBifrost/pkg/upstream"
 )
 
-var Version = "1.0.1"
+var Version = "1.0.2"
 const RepoName = "TarsBifrost"
+
+// rateLimiter provides per-IP token-bucket-like rate limiting.
+type rateLimiter struct {
+	mu      sync.RWMutex
+	entries map[string]*rateEntry
+	limit   int
+	window  time.Duration
+}
+
+type rateEntry struct {
+	count int
+	reset time.Time
+}
+
+func newRateLimiter(limit int, window time.Duration) *rateLimiter {
+	return &rateLimiter{
+		entries: make(map[string]*rateEntry),
+		limit:   limit,
+		window:  window,
+	}
+}
+
+func (rl *rateLimiter) allow(ip string) bool {
+	now := time.Now()
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	e, ok := rl.entries[ip]
+	if !ok || now.After(e.reset) {
+		rl.entries[ip] = &rateEntry{count: 1, reset: now.Add(rl.window)}
+		return true
+	}
+	if e.count >= rl.limit {
+		return false
+	}
+	e.count++
+	return true
+}
+
+func (rl *rateLimiter) cleanup() {
+	now := time.Now()
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	for ip, e := range rl.entries {
+		if now.After(e.reset) {
+			delete(rl.entries, ip)
+		}
+	}
+}
+
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if idx := strings.Index(xff, ","); idx != -1 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xri := r.Header.Get("X-Real-Ip"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if host != "" { return host }
+	return r.RemoteAddr
+}
+
+func genRequestID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+type contextKey string
+const reqIDKey contextKey = "requestID"
+
+func getReqID(ctx context.Context) string {
+	if id, ok := ctx.Value(reqIDKey).(string); ok {
+		return id
+	}
+	return ""
+}
 
 func main() {
 	version := flag.Bool("version", false, "print version and exit")
@@ -27,20 +113,37 @@ func main() {
 	if err != nil { log.Fatalf("加载配置失败：%v", err) }
 	client := upstream.NewClient(cfg.Endpoint, cfg.APIKey, cfg.Timeout)
 	log.Printf("[%s] starting v%s endpoint=%s", RepoName, Version, cfg.Endpoint)
+
+	rl := newRateLimiter(60, time.Minute)
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C { rl.cleanup() }
+	}()
+
 	mode := os.Getenv("TARS_MCP_MODE")
 	if mode == "" { mode = "stdio" }
-	srv := &http.Server{Addr: ":8080", ReadTimeout: time.Duration(cfg.Timeout) * time.Second, WriteTimeout: time.Duration(cfg.Timeout) * time.Second}
-	http.HandleFunc("/health", withClient(client, healthHandler))
-	http.HandleFunc("/tools", withClient(client, toolsHandler))
-	http.HandleFunc("/invoke", withClient(client, invokeHandler))
-	http.HandleFunc("/models", withClient(client, modelsHandler))
+	srv := &http.Server{
+		Addr:         ":8080",
+		ReadTimeout:  time.Duration(cfg.Timeout) * time.Second,
+		WriteTimeout: time.Duration(cfg.Timeout) * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+	http.HandleFunc("/health", withMiddleware(client, rl, healthHandler))
+	http.HandleFunc("/tools", withMiddleware(client, rl, toolsHandler))
+	http.HandleFunc("/invoke", withMiddleware(client, rl, invokeHandler))
+	http.HandleFunc("/models", withMiddleware(client, rl, modelsHandler))
+
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 		log.Printf("[%s] shutting down", RepoName)
-		_ = srv.Close()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
 	}()
+
 	if mode == "stdio" { runStdioServer(client); return }
 	log.Printf("[%s] HTTP listening on %s", RepoName, srv.Addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -48,17 +151,66 @@ func main() {
 	}
 }
 
-func withClient(client *upstream.Client, fn func(http.ResponseWriter, *http.Request, *upstream.Client)) http.HandlerFunc {
+func withMiddleware(client *upstream.Client, rl *rateLimiter, fn func(http.ResponseWriter, *http.Request, *upstream.Client)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		reqID := genRequestID()
+		ctx := context.WithValue(r.Context(), reqIDKey, reqID)
+		r = r.WithContext(ctx)
+
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID")
+		w.Header().Set("X-Request-ID", reqID)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
-		fn(w, r, client)
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+		if r.TLS != nil {
+			w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+		}
+		if r.Method == http.MethodOptions { w.WriteHeader(http.StatusNoContent); return }
+
+		ip := clientIP(r)
+		if !rl.allow(ip) {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"error":      "请求过于频繁，请稍后再试",
+				"request_id": reqID,
+			})
+			log.Printf("[RATE_LIMIT] ip=%s method=%s path=%s request_id=%s", ip, r.Method, r.URL.Path, reqID)
+			return
+		}
+
+		// Wrap response writer to capture status code
+		wr := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+		fn(wr, r, client)
+
+		log.Printf("[REQ] method=%s path=%s ip=%s status=%d duration=%s request_id=%s",
+			r.Method, r.URL.Path, ip, wr.statusCode, time.Since(start).Round(time.Millisecond), reqID)
 	}
+}
+
+type responseRecorder struct {
+	http.ResponseWriter
+	statusCode int
+	written    bool
+}
+
+func (rr *responseRecorder) WriteHeader(code int) {
+	if !rr.written {
+		rr.statusCode = code
+		rr.written = true
+		rr.ResponseWriter.WriteHeader(code)
+	}
+}
+
+func (rr *responseRecorder) Write(b []byte) (int, error) {
+	if !rr.written {
+		rr.WriteHeader(http.StatusOK)
+	}
+	return rr.ResponseWriter.Write(b)
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request, client *upstream.Client) {
@@ -68,6 +220,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request, client *upstream.Clie
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status": "ok", "version": Version, "name": RepoName, "upstream": up,
 		"time": time.Now().UTC().Format(time.RFC3339),
+		"request_id": getReqID(r.Context()),
 	})
 }
 
