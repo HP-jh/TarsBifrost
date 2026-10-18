@@ -1,70 +1,33 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
+	"strconv"
+	"strings"
 )
 
-// Cfg 全局配置
-type Cfg struct {
-	Endpoint string `json:"endpoint"`
-	APIKey   string `json:"api_key"`
-	Timeout  int    `json:"timeout"`
-	LogLevel string `json:"log_level"`
+type Config struct {
+	Endpoint string
+	APIKey   string
+	Timeout  int
 }
 
-func Default() *Cfg {
-	return &Cfg{
-		Endpoint: os.Getenv("TARS_BIFROST_ENDPOINT"),
-		APIKey:   os.Getenv("TARS_BIFROST_API_KEY"),
-		Timeout:  30,
-		LogLevel: "info",
+func Load(path string) (*Config, error) {
+	endpoint := os.Getenv("TARS_MCP_ENDPOINT")
+	if endpoint == "" { endpoint = os.Getenv("BIFROST_ENDPOINT") }
+	apiKey := os.Getenv("TARS_MCP_API_KEY")
+	if apiKey == "" { apiKey = os.Getenv("BIFROST_API_KEY") }
+	timeout := 30
+	if v := os.Getenv("TARS_MCP_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 { timeout = n }
 	}
-}
-
-func Load(path string) (*Cfg, error) {
-	if path == "" {
-		home, _ := os.UserHomeDir()
-		path = filepath.Join(home, ".tars", "bifrost", "config.json")
+	if endpoint == "" {
+		return nil, fmt.Errorf("环境变量 TARS_MCP_ENDPOINT 或 BIFROST_ENDPOINT 未设置")
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return Default(), nil
-		}
-		return nil, err
-	}
-	var c Cfg
-	if err := json.Unmarshal(data, &c); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
-	}
-	// env vars override file
-	if v := os.Getenv("TARS_BIFROST_ENDPOINT"); v != "" {
-		c.Endpoint = v
-	}
-	if v := os.Getenv("TARS_BIFROST_API_KEY"); v != "" {
-		c.APIKey = v
-	}
-	if c.Timeout <= 0 {
-		c.Timeout = 30
-	}
-	if c.LogLevel == "" {
-		c.LogLevel = "info"
-	}
-	return &c, nil
-}
-
-func (c *Cfg) Save(path string) error {
-	if path == "" {
-		home, _ := os.UserHomeDir()
-		path = filepath.Join(home, ".tars", "bifrost", "config.json")
-	}
-	_ = os.MkdirAll(filepath.Dir(path), 0755)
-	data, err := json.MarshalIndent(c, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0600)
+	return &Config{
+		Endpoint: strings.TrimRight(endpoint, "/"),
+		APIKey:   apiKey,
+		Timeout:  timeout,
+	}, nil
 }
