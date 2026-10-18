@@ -49,3 +49,9 @@ func TestInvokeHandler_UnknownTool(t *testing.T) {
 	invokeHandler(w, req, client)
 	if w.Code != http.StatusBadRequest { t.Fatalf("expected 400, got %d", w.Code) }
 }
+
+func TestVersionBumped(t *testing.T) {
+	if Version != "1.0.1" {
+		t.Fatalf("Version expected 1.0.1, got %s", Version)
+	}
+}

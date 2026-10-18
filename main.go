@@ -16,7 +16,7 @@ import (
 	"github.com/HP-jh/TarsBifrost/pkg/upstream"
 )
 
-var Version = "1.0.0"
+var Version = "1.0.1"
 const RepoName = "TarsBifrost"
 
 func main() {
